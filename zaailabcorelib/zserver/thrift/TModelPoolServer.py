@@ -29,6 +29,13 @@ WAIT_PROCESS = 2
 SEND_ANSWER = 3
 CLOSED = 4
 
+READ_ONLY = select.POLLIN | select.POLLPRI 
+WRITE_ONLY = select.POLLOUT
+READ_WRITE = READ_ONLY | WRITE_ONLY
+ERROR = select.POLLERR
+CLOSE = select.POLLHUP 
+TIMEOUT = 1000
+
 
 class ThreadWkr(Thread):
     def __init__(self, *args, **kwargs):
@@ -434,6 +441,46 @@ class TModelPoolServer(object):
         for oob in xset:
             self.clients[oob].close()
             del self.clients[oob]
+    
+    def xhandle(self):
+        assert self.prepared
+        poller = select.poll()
+        poller.register(self.tsocket.handle.fileno(), READ_WRITE)
+        poller.register(self._read(), READ_ONLY)
+        events = poller.poll(TIMEOUT)
+        for fd, flag in events :
+
+            if flag & READ_ONLY != 0:
+                if fd == self._read.fileno():
+                    self._read.recv(1024)
+                elif fd == self.tsocket.handle.fileno():
+                    try:
+                        client = self.tsocket.accept()
+                        if client:
+                            self.clients[client.handle.fileno()] = Connection(client.handle,
+                                                                                self.wake_up)
+                    except socket.error:
+                        logger.debug('error while accepting', exc_info=True)
+                else:
+                    connection = self.clients[fd]
+                    connection.read()
+                    if connection.received:
+                        connection.status = WAIT_PROCESS
+                        msg = connection.received.popleft()
+                        itransport = TTransport.TMemoryBuffer(
+                            msg.buffer, msg.offset)
+                        otransport = TTransport.TMemoryBuffer()
+                        iprot = self.protocol_factory.getProtocol(itransport)
+                        oprot = self.protocol_factory.getProtocol(otransport)
+
+                        rand_idx = random.randint(0, len(self.list_task_queue) - 1)
+                        self.list_task_queue[rand_idx].put(
+                            [iprot, oprot, otransport, fd])   
+            if flag & WRITE_ONLY != 0:
+                self.clients[fd].write()
+            if flag & ERROR != 0:
+                self.clients[fd].close()
+                del self.clients[fd]
 
     def serve(self):
         """Serve requests.
