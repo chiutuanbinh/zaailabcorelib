@@ -8,7 +8,9 @@ import struct
 import threading
 
 from collections import deque
+from typing import Dict, List
 from six.moves import queue
+from zaailabcorelib.thrift.Thrift import TProcessor
 
 from zaailabcorelib.thrift.transport import TTransport
 from zaailabcorelib.thrift.protocol.TBinaryProtocol import TBinaryProtocolFactory
@@ -16,7 +18,9 @@ from multiprocessing import Process, Queue
 import traceback
 from zaailabcorelib.thrift.protocol import TBinaryProtocol
 from zaailabcorelib.thrift.transport.TTransport import TTransportException
+from zaailabcorelib.thrift.transport.TSocket import TServerSocket, TSocket
 import random
+
 
 __all__ = ['TModelPoolServer']
 
@@ -32,8 +36,7 @@ CLOSED = 4
 READ_ONLY = select.POLLIN | select.POLLPRI 
 WRITE_ONLY = select.POLLOUT
 READ_WRITE = READ_ONLY | WRITE_ONLY
-ERROR = select.POLLERR
-CLOSE = select.POLLHUP 
+ERROR = select.POLLERR | select.POLLHUP  | select.POLLNVAL
 TIMEOUT = 1000
 
 
@@ -89,7 +92,7 @@ class ProcessWrk(Process):
             self._handler = self._handler_cls()
         else:
             self._handler = self._handler_cls(**self._model_config)
-        self._processor = self._processor_cls(self._handler)
+        self._processor  = self._processor_cls(self._handler)
 
         while True:
             try:
@@ -185,7 +188,7 @@ class Connection(object):
         CLOSED --- socket was closed and connection should be deleted.
     """
 
-    def __init__(self, new_socket, wake_up):
+    def __init__(self, new_socket : socket.socket, wake_up):
         self.socket = new_socket
         self.socket.setblocking(False)
         self.status = WAIT_LEN
@@ -301,17 +304,17 @@ class Connection(object):
 class TModelPoolServer(object):
     """TModelPoolServer is based on Non-blocking server."""
 
-    def __init__(self, handler_cls, processor_cls, tsocket, protocol_factory, worker_type='process', *args, **kwargs):
+    def __init__(self, handler_cls, processor_cls, tsocket: TServerSocket, protocol_factory, worker_type='process', *args, **kwargs):
         assert worker_type in ['process', 'thread']
         self.worker_type = worker_type
         self.handler_cls = handler_cls
-        self.processor_cls = processor_cls
-        self.tsocket = tsocket
+        self.processor_cls : TProcessor = processor_cls
+        self.tsocket : TServerSocket  = tsocket
         self.transport_factory = kwargs.get(
             'transport_factory')  # The default is FrameTransport
         self.protocol_factory = protocol_factory
         self.list_model_config = kwargs.get("list_model_config", [])
-        self.clients = {}  # Store client connection
+        self.clients: Dict[int, Connection] = {}  # Store client connection
         self.callback_queue = Queue()
         self._read, self._write = socket.socketpair()
         self.list_task_queue = []  # Distribute task to Worker
@@ -319,6 +322,9 @@ class TModelPoolServer(object):
 
         self.prepared = False
         self._stop = False
+
+        self.poller = select.poll()
+        
 
     def prepare(self):
         """Prepares server for serve requests."""
@@ -351,6 +357,8 @@ class TModelPoolServer(object):
         result_dist = ConnectionStateChanger(self.callback_queue, self.clients)
         result_dist.setDaemon(True)
         result_dist.start()
+        self.poller.register(self.tsocket.handle.fileno(), READ_WRITE)
+        self.poller.register(self._read.fileno(), READ_ONLY)
         self.prepared = True
 
     def wake_up(self):
@@ -383,8 +391,8 @@ class TModelPoolServer(object):
 
     def _select(self):
         """Does select on open connections."""
-        readable = [self.tsocket.handle.fileno(), self._read.fileno()]
-        writable = []
+        readable : List[int] = [self.tsocket.handle.fileno(), self._read.fileno()] #list file descriptor
+        writable : List[int] = []
         remaining = []
         for i, connection in list(self.clients.items()):
             if connection.is_readable():
@@ -395,6 +403,7 @@ class TModelPoolServer(object):
                 writable.append(connection.fileno())
             if connection.is_closed():
                 del self.clients[i]
+
         if remaining:
             return remaining, [], [], False
         else:
@@ -441,15 +450,12 @@ class TModelPoolServer(object):
         for oob in xset:
             self.clients[oob].close()
             del self.clients[oob]
-    
+
     def xhandle(self):
         assert self.prepared
-        poller = select.poll()
-        poller.register(self.tsocket.handle.fileno(), READ_WRITE)
-        poller.register(self._read(), READ_ONLY)
-        events = poller.poll(TIMEOUT)
+        
+        events = self.poller.poll(TIMEOUT)
         for fd, flag in events :
-
             if flag & READ_ONLY != 0:
                 if fd == self._read.fileno():
                     self._read.recv(1024)
@@ -459,28 +465,36 @@ class TModelPoolServer(object):
                         if client:
                             self.clients[client.handle.fileno()] = Connection(client.handle,
                                                                                 self.wake_up)
+                            self.poller.register(client.handle.fileno(), READ_WRITE)
                     except socket.error:
                         logger.debug('error while accepting', exc_info=True)
                 else:
                     connection = self.clients[fd]
-                    connection.read()
-                    if connection.received:
-                        connection.status = WAIT_PROCESS
-                        msg = connection.received.popleft()
-                        itransport = TTransport.TMemoryBuffer(
-                            msg.buffer, msg.offset)
-                        otransport = TTransport.TMemoryBuffer()
-                        iprot = self.protocol_factory.getProtocol(itransport)
-                        oprot = self.protocol_factory.getProtocol(otransport)
+                    if connection.is_readable():
+                        connection.read()
+                        if connection.received:
+                            connection.status = WAIT_PROCESS
+                            msg = connection.received.popleft()
+                            itransport = TTransport.TMemoryBuffer(
+                                msg.buffer, msg.offset)
+                            otransport = TTransport.TMemoryBuffer()
+                            iprot = self.protocol_factory.getProtocol(itransport)
+                            oprot = self.protocol_factory.getProtocol(otransport)
 
-                        rand_idx = random.randint(0, len(self.list_task_queue) - 1)
-                        self.list_task_queue[rand_idx].put(
-                            [iprot, oprot, otransport, fd])   
+                            rand_idx = random.randint(0, len(self.list_task_queue) - 1)
+                            self.list_task_queue[rand_idx].put(
+                                    [iprot, oprot, otransport, fd])   
             if flag & WRITE_ONLY != 0:
-                self.clients[fd].write()
+                if self.clients[fd].is_writeable():
+                    self.clients[fd].write()
             if flag & ERROR != 0:
+                self.poller.unregister(fd)
                 self.clients[fd].close()
                 del self.clients[fd]
+                
+
+
+
 
     def serve(self):
         """Serve requests.
@@ -489,4 +503,4 @@ class TModelPoolServer(object):
         self._stop = False
         self.prepare()
         while not self._stop:
-            self.handle()
+            self.xhandle()
